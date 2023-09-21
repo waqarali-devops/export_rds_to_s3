@@ -1,0 +1,196 @@
+Description: CloudFormation template for deploying IAM Key Rotation Process.
+Parameters:
+  RDSClusterId:
+    Description: RDS Cluster Id
+    Type: String
+    Default: cms
+  BucketName:
+    Description: Bucket Name
+    Type: String
+    Default: lambdardssnapshots3
+Resources:
+  RDSS3Role:
+      Type: AWS::IAM::Role
+      Properties:
+        Description: Role to allow rds to export snapshot in s3
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - export.rds.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        ManagedPolicyArns:
+        - !Ref RDSS3Policy
+  RDSS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "RDSSnapshotToS3Policy"
+      Description: Policy created for IAM key rotation process
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:PutObject*'
+              - 's3:ListBucket'
+              - 's3:GetObject*'
+              - 's3:DeleteObject*'
+              - 's3:GetBucketLocation'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:GenerateDataKeyWithoutPlaintext'
+              - 'kms:ReEncryptFrom'
+              - 'kms:ReEncryptTo'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+              - 'kms:RetireGrant'
+            Resource: '*'
+  RDSS3Key:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: An example symmetric encryption KMS key for rds snapshot
+      EnableKeyRotation: true
+      PendingWindowInDays: 20
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: rds-snapshot-s3-key
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: 'kms:*'
+            Resource: '*'
+  
+  IAMLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: An IAM role created for key rotation Lambda FunctionName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Ref IAMLambdaPolicy
+  
+  IAMLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "lambda-rds-snapshot-to-s3-policy"
+      Description: Policy created for IAM key rotation process
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'rds:DescribeDBClusterSnapshots'
+              - 'rds:DescribeDBClusters'
+              - 'rds:DescribeDBInstances'
+              - 'rds:DescribeDBSnapshots'
+              - 'rds:DescribeExportTasks'
+              - 'rds:StartExportTask'
+              - 'iam:PassRole'
+            Resource: '*'
+
+  LambdaExportSnapshotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "BackupRdstoS3"
+      Description: A lambda function that instantiate Rds snapshot backup in s3
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt 'IAMLambdaRole.Arn'
+      MemorySize: 128
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime
+          client = boto3.client("rds")
+
+          def get_db_snapshot():
+              """
+              Funtion to get the latest snapshot
+              Returns: Latest snapshot
+              """
+              db_cluster_id = os.environ["DB_CLUSTER_ID"]
+              
+              desc_cluster_snapshots = client.describe_db_cluster_snapshots(
+                                  DBClusterIdentifier=db_cluster_id,
+                                  SnapshotType="automated"
+                                  )
+              db_snapshots = {}
+              print(len(desc_cluster_snapshots["DBClusterSnapshots"]))
+              
+              for snapshot in desc_cluster_snapshots["DBClusterSnapshots"]:
+                  db_snapshots.update([(snapshot["DBClusterSnapshotArn"], snapshot["SnapshotCreateTime"])])
+              
+              return (max(db_snapshots.items()))
+              
+          def jsondatetimeconverter(o):
+              """To avoid TypeError: datetime.datetime(...) is not JSON serializable"""
+              if isinstance(o, datetime):
+                  return o.__str__()
+                  
+          def handler(event, context):
+              """
+              Function to invoke start_export_task using
+              recent most system snapshot
+              Return: Response 
+              """
+              
+              s3_bucket = os.environ["S3_BUCKET"]
+              iam_role = os.environ["IAM_ROLE"]
+              kms_key = os.environ["KMS_KEY"]
+                  
+              get_latest_snapshot_name,get_latest_snapshot_time  = get_db_snapshot()
+              if get_latest_snapshot_time.date() == datetime.today().date():
+                  today_date = datetime.today().strftime("%Y%m%d")
+                  export_task = "db-table-backup-"+today_date
+                  print(get_latest_snapshot_time)
+                  
+                  response = client.start_export_task(
+                          ExportTaskIdentifier=export_task,
+                          SourceArn=get_latest_snapshot_name,
+                          S3BucketName=s3_bucket,
+                          IamRoleArn=iam_role,
+                          KmsKeyId=kms_key,
+                      )
+                      
+                  return(json.dumps(response, default=jsondatetimeconverter))
+              else:
+                  return("Not invoking start export task as the backup its not the latest backup.")
+      Environment:
+        Variables:
+          DB_CLUSTER_ID : !Ref RDSClusterId
+          KMS_KEY       : !Ref RDSS3Key
+          IAM_ROLE      : !GetAtt RDSS3Role.Arn
+          S3_BUCKET     : !Ref BucketName
+
+          
+  RDSSnapshotS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+
+Outputs:
+    IAMROLE:
+      Value: !GetAtt RDSS3Role.Arn
+      Description: Role for rds to give export permission
+    KMSKEY:
+      Value: !Ref RDSS3Key
